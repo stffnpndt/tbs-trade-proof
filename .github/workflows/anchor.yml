@@ -1,0 +1,93 @@
+# Timestamps every new journal head and archives it - runs on GitHub, outside the trader's control.
+#
+#  on push      : the current chain head (last line of journal.jsonl) is written to
+#                 heads/<seq>-<hash>.txt on branch 'proofs' and stamped with OpenTimestamps
+#                 (calendar servers -> Bitcoin). The exact journal file of this commit is
+#                 saved to the Wayback Machine.
+#  every 6 hours: pending OpenTimestamps proofs are upgraded to complete Bitcoin proofs.
+#
+# If several pushes arrive at once, only the newest head may get its own stamp. That is
+# enough: a stamped head fixes every entry before it (hash chain).
+
+name: anchor
+
+on:
+  push:
+    branches: [main]
+    paths: ["journal.jsonl"]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: anchor
+  cancel-in-progress: false
+
+jobs:
+  anchor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: main
+
+      - uses: actions/checkout@v4
+        with:
+          ref: proofs
+          path: proofs
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenTimestamps client
+        run: pip install --quiet opentimestamps-client
+
+      - name: Stamp the chain head
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -e
+          test -s main/journal.jsonl || { echo "journal empty"; exit 0; }
+          read -r SEQ HEAD < <(python3 -c '
+          import json
+          last = [l for l in open("main/journal.jsonl", encoding="utf-8") if l.strip()][-1]
+          d = json.loads(last)
+          print(d["seq"], d["hash"])')
+          mkdir -p proofs/heads
+          F="proofs/heads/$(printf '%06d' "$SEQ")-$HEAD.txt"
+          if [ ! -f "$F" ]; then
+            printf '%s\n' "$HEAD" > "$F"
+            ots stamp "$F"
+            [ -f proofs/index.csv ] || echo "seq,head,commit,stamped_at_utc" > proofs/index.csv
+            echo "$SEQ,$HEAD,$GITHUB_SHA,$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> proofs/index.csv
+            echo "stamped seq $SEQ head $HEAD"
+          fi
+
+      - name: Upgrade pending proofs
+        run: |
+          shopt -s nullglob
+          for P in proofs/heads/*.ots; do
+            ots upgrade "$P" >/dev/null 2>&1 || true
+          done
+          rm -f proofs/heads/*.bak
+
+      - name: Commit proofs
+        run: |
+          cd proofs
+          git config user.name "proof-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "anchor ${GITHUB_SHA::12}"
+            git push origin proofs
+          fi
+
+      - name: Archive on the Wayback Machine
+        if: github.event_name == 'push'
+        run: |
+          curl -s -o /dev/null -m 120 \
+            "https://web.archive.org/save/https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/journal.jsonl" \
+            || echo "Wayback save failed (not critical)"
